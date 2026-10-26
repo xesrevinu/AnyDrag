@@ -74,22 +74,26 @@ final class TitleBarDragStrategy {
 
     /// Modifier flags stripped from injected/rewritten title-bar events.
     ///
-    /// Only Control is stripped: AppKit converts Control+leftMouseDown to a
-    /// "secondary click" (Finder pops the toolbar context menu, etc.) at the
-    /// NSResponder layer, breaking the title-bar drag.
+    /// - Control: AppKit turns Control+leftMouseDown into a secondary click
+    ///   (context menu) at the NSResponder layer — native title-bar drag never
+    ///   starts.
+    /// - Command: Cmd+click on a title bar is the document-path / proxy-icon
+    ///   gesture, not a drag. With a ⌃⌘ (or ⌘-only) AnyDrag shortcut the
+    ///   synthetic press would still carry Command after Control was cleared,
+    ///   so move failed while resize (corner hit-test) kept working.
+    /// - Shift: Shift+click also changes title-bar / proxy behaviour; strip it
+    ///   when it is part of a held chord so the window server sees a plain
+    ///   leftMouseDown.
     ///
-    /// Option was tried briefly but does NOT achieve full suppression of the
-    /// macOS "Hold option key while dragging windows to tile" feature: macOS
-    /// reads the physical Option key state independently of the event flags,
-    /// so stripping the flag only hides the overlay while the snap-on-release
-    /// still fires. Half-suppression is worse than passing through, so Option
-    /// is left intact. To fully suppress, we'd have to synthesize an Option
-    /// keyUp into the system before the drag (with side effects on other
-    /// apps' keyboard listeners) — not worth it.
+    /// Option is intentionally left intact: macOS reads the physical Option
+    /// key for "hold Option while dragging to tile" independently of event
+    /// flags, so stripping the flag only hides the overlay while snap-on-
+    /// release still fires. Half-suppression is worse than passing through.
+    ///
     /// Also read by the engine so `TrailingFlagScrubber` can repeat the same
     /// scrub at the tail of the tap chain, after any downstream tool has
     /// re-asserted the flags we cleared here.
-    static let modifierFlagsToStrip: CGEventFlags = [.maskControl]
+    static let modifierFlagsToStrip: CGEventFlags = [.maskControl, .maskCommand, .maskShift]
 
     private let debugDot = DebugDotOverlay()
 
