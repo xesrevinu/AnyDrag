@@ -83,8 +83,13 @@ final class TitleBarDragStrategy {
     private var axEnhancedUIWasOn = false
     private var lastAXWriteUptime: TimeInterval = 0
     /// After synth-down, how long we wait before declaring title-bar a miss.
-    private static let titleBarPromoteGrace: TimeInterval = 0.09
-    private static let axWriteMinInterval: TimeInterval = 1.0 / 60.0
+    /// Too short (≲100ms) promotes native apps (Ghostty) before WindowServer
+    /// has committed the first frame of the title-bar drag.
+    private static let titleBarPromoteGrace: TimeInterval = 0.22
+    /// Require real cursor travel before promoting — avoids AX teleports on
+    /// click-without-drag and filters tap jitter.
+    private static let titleBarPromoteMinTravel: CGFloat = 8
+    private static let axWriteMinInterval: TimeInterval = 1.0 / 120.0
 
     /// How long the synthetic press waits for the compositor to expose the
     /// target before it is sent regardless.
@@ -455,15 +460,22 @@ final class TitleBarDragStrategy {
             )
         }
         // auto: if title-bar synth is a no-op, promote to AX.
-        if moveTransportMode == .auto, didSendSyntheticDown,
-           now() - gestureStartTime >= Self.titleBarPromoteGrace {
-            let live = (dragWindowID != 0 ? Self.windowOrigin(of: dragWindowID) : nil)
-                ?? windowOriginForPID(pendingPID, near: startWindowOrigin)
-            let moved = live.map { abs($0.x - startWindowOrigin.x) >= 1 || abs($0.y - startWindowOrigin.y) >= 1 } ?? false
-            if !moved {
-                Self.log.info("titleBar miss → promote ax app=\"\(debugAppName)\" after \(draggedEventCount) drags")
-                promoteToAX(fromTitleBarWith: event)
-                return handleAXDragged(event: event)
+        if moveTransportMode == .auto, didSendSyntheticDown {
+            let travel = hypot(pos.x - startCursor.x, pos.y - startCursor.y)
+            let aged = now() - max(gestureStartTime, startupDeadline - Self.startupGracePeriod)
+            // `startupDeadline` still holds arm+grace even after synth-down.
+            if travel >= Self.titleBarPromoteMinTravel, aged >= Self.titleBarPromoteGrace {
+                let live = (dragWindowID != 0 ? Self.windowOrigin(of: dragWindowID) : nil)
+                    ?? windowOriginForPID(pendingPID, near: startWindowOrigin)
+                let moved = live.map { abs($0.x - startWindowOrigin.x) >= 1 || abs($0.y - startWindowOrigin.y) >= 1 } ?? false
+                if !moved {
+                    Self.log.info(
+                        "titleBar miss → promote ax app=\"\(debugAppName)\" " +
+                        "after \(draggedEventCount) drags travel=\(Int(travel))"
+                    )
+                    promoteToAX(fromTitleBarWith: event)
+                    return handleAXDragged(event: event)
+                }
             }
         }
         return Unmanaged.passUnretained(event)
@@ -569,30 +581,49 @@ final class TitleBarDragStrategy {
     }
 
     private func promoteToAX(fromTitleBarWith event: CGEvent) {
-        // Drop any half-open native title-bar drag so the app is not left
-        // thinking the button is still down at the synthetic point.
-        if didSendSyntheticDown, let up = CGEvent(
-            mouseEventSource: nil, mouseType: .leftMouseUp,
-            mouseCursorPosition: event.location, mouseButton: .left
-        ) {
-            up.flags = event.flags.subtracting(Self.modifierFlagsToStrip)
-            up.post(tap: .cgSessionEventTap)
+        // End any half-open native title-bar drag at the *synthetic* point
+        // (not the real cursor). Posting mouseUp at the cursor while mouseDown
+        // was rewritten to a distant title-bar aim point makes WindowServer
+        // treat the release as a huge drag — the "window floats away" bug.
+        if didSendSyntheticDown {
+            let upPoint = CGPoint(
+                x: (event.location.x + xOffset).rounded(),
+                y: (event.location.y + yOffset).rounded()
+            )
+            if let up = CGEvent(
+                mouseEventSource: nil, mouseType: .leftMouseUp,
+                mouseCursorPosition: upPoint, mouseButton: .left
+            ) {
+                up.flags = event.flags.subtracting(Self.modifierFlagsToStrip)
+                up.post(tap: .cgSessionEventTap)
+            }
         }
         needsInitialMouseDown = false
         didSendSyntheticDown = false
         activeTransport = .ax
-        let frame = CGRect(origin: startWindowOrigin, size: CGSize(width: 200, height: 200))
-        // Prefer live frame from CG for AX match.
+
+        // Re-baseline to the *current* window origin and cursor. Otherwise AX
+        // reapplies the whole mouseDown→now delta and the window teleports.
         let liveFrame: CGRect
         if dragWindowID != 0,
            let infos = CGWindowListCopyWindowInfo([.optionIncludingWindow], dragWindowID) as? [[CFString: Any]],
            let bounds = infos.first?[kCGWindowBounds] as? [String: Any],
            let r = CGRect(dictionaryRepresentation: bounds as CFDictionary) {
             liveFrame = r
+        } else if let origin = windowOriginForPID(pendingPID, near: startWindowOrigin) {
+            liveFrame = CGRect(origin: origin, size: CGSize(width: 200, height: 200))
         } else {
-            liveFrame = frame
+            liveFrame = CGRect(origin: startWindowOrigin, size: CGSize(width: 200, height: 200))
         }
+        startWindowOrigin = liveFrame.origin
+        startCursor = event.location
         armAX(pid: pendingPID, windowFrame: liveFrame)
+        Self.log.info(
+            "ax-promote-baseline app=\"\(debugAppName)\" " +
+            "origin=(\(Int(startWindowOrigin.x)),\(Int(startWindowOrigin.y))) " +
+            "cursor=(\(String(format: "%.1f", startCursor.x)),\(String(format: "%.1f", startCursor.y))) " +
+            "ax=\(axWindow != nil)"
+        )
     }
 
     private func handleAXDragged(event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -607,10 +638,16 @@ final class TitleBarDragStrategy {
             x: (startWindowOrigin.x + (cursor.x - startCursor.x)).rounded(),
             y: (startWindowOrigin.y + (cursor.y - startCursor.y)).rounded()
         )
-        if let axWindow, let value = AXValueCreate(.cgPoint, &origin) {
+        guard let axWindow else {
+            if draggedEventCount <= 3 {
+                Self.log.warn("ax-drag skipped — no AX window app=\"\(debugAppName)\"")
+            }
+            return nil
+        }
+        if let value = AXValueCreate(.cgPoint, &origin) {
             let err = AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, value)
             if draggedEventCount <= 3 || err != .success {
-                Self.log.debug(
+                Self.log.info(
                     "ax-drag #\(draggedEventCount) app=\"\(debugAppName)\" " +
                     "origin=(\(Int(origin.x)),\(Int(origin.y))) err=\(err.rawValue)"
                 )
@@ -753,18 +790,38 @@ final class TitleBarDragStrategy {
     /// Used only to raise the target on mouseDown — not called during drag.
     private func findAXWindow(pid: pid_t, windowFrame: CGRect) -> AXUIElement? {
         let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.05)
         var windowsRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
               let windows = windowsRef as? [AXUIElement]
         else { return nil }
 
-        return windows.first { axWin in
+        var best: AXUIElement?
+        var bestScore = CGFloat.greatestFiniteMagnitude
+        for axWin in windows {
             var posRef: CFTypeRef?
-            AXUIElementCopyAttributeValue(axWin, kAXPositionAttribute as CFString, &posRef)
-            guard let posVal = posRef, CFGetTypeID(posVal) == AXValueGetTypeID() else { return false }
+            var sizeRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(axWin, kAXPositionAttribute as CFString, &posRef) == .success,
+                  AXUIElementCopyAttributeValue(axWin, kAXSizeAttribute as CFString, &sizeRef) == .success,
+                  let posVal = posRef, CFGetTypeID(posVal) == AXValueGetTypeID(),
+                  let sizeVal = sizeRef, CFGetTypeID(sizeVal) == AXValueGetTypeID()
+            else { continue }
             var pos = CGPoint.zero
+            var size = CGSize.zero
             AXValueGetValue(posVal as! AXValue, .cgPoint, &pos)
-            return abs(pos.x - windowFrame.origin.x) < 5 && abs(pos.y - windowFrame.origin.y) < 5
+            AXValueGetValue(sizeVal as! AXValue, .cgSize, &size)
+            // Tight match on origin; fall back to center/size proximity for
+            // Electron whose AX frame often disagrees with CGWindowList by >5pt.
+            let originDist = abs(pos.x - windowFrame.origin.x) + abs(pos.y - windowFrame.origin.y)
+            let sizeDist = abs(size.width - windowFrame.width) + abs(size.height - windowFrame.height)
+            let centerDist = abs((pos.x + size.width / 2) - windowFrame.midX)
+                + abs((pos.y + size.height / 2) - windowFrame.midY)
+            let score = originDist < 8 ? originDist : (centerDist + sizeDist * 0.25)
+            if score < bestScore {
+                bestScore = score
+                best = axWin
+            }
         }
+        return bestScore < 400 ? best : nil
     }
 }
