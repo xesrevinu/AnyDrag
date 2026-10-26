@@ -73,6 +73,11 @@ final class TitleBarDragStrategy {
     private var didSendSyntheticDown = false
     private var startWindowOrigin: CGPoint = .zero
     private var startCursor: CGPoint = .zero
+    /// Hardware cursor position before title-bar coordinate rewrite. Rewriting
+    /// `event.location` and passing the event through warps the system cursor
+    /// to the synthetic point; we warp back so the pointer stays under the
+    /// user's hand (critical when the window does not actually move).
+    private var lastRealCursor: CGPoint = .zero
     private var debugAppName: String = ""
     private let activateApplication: (pid_t, NSApplication.ActivationOptions) -> Bool
     private let coveringPID: (CGWindowID, CGPoint) -> pid_t?
@@ -90,6 +95,20 @@ final class TitleBarDragStrategy {
     /// click-without-drag and filters tap jitter.
     private static let titleBarPromoteMinTravel: CGFloat = 8
     private static let axWriteMinInterval: TimeInterval = 1.0 / 120.0
+
+    /// Pass a location-rewritten event through the tap without leaving the
+    /// on-screen cursor at the synthetic point.
+    private func passRewritten(_ event: CGEvent, realCursor: CGPoint) -> Unmanaged<CGEvent>? {
+        lastRealCursor = realCursor
+        let result = Unmanaged.passUnretained(event)
+        // Restore immediately so rewriting title-bar coordinates does not yank
+        // the on-screen pointer to the synthetic aim point.
+        if let source = CGEventSource(stateID: .combinedSessionState) {
+            source.localEventsSuppressionInterval = 0
+        }
+        CGWarpMouseCursorPosition(realCursor)
+        return result
+    }
 
     /// How long the synthetic press waits for the compositor to expose the
     /// target before it is sent regardless.
@@ -272,9 +291,14 @@ final class TitleBarDragStrategy {
         startCursor = cursorPos
         let initialTransport: MoveTransport = {
             switch moveTransportMode {
-            case .ax: return .ax
+            case .ax, .auto:
+                // `auto` goes AX-first: title-bar coordinate rewrite warps the
+                // system cursor to the aim point, and when the window does not
+                // follow (Electron/Pake/GPUI) the pointer just "flies away".
+                // AX swallows events and never rewrites cursor location.
+                return .ax
             case .sls: return SLSWindowGeometry.isAvailable ? .sls : .ax
-            case .titleBar, .auto: return .titleBar
+            case .titleBar: return .titleBar
             }
         }()
         Self.log.info(
@@ -431,13 +455,15 @@ final class TitleBarDragStrategy {
             if rewriteToLeftButton {
                 event.setIntegerValueField(.mouseEventButtonNumber, value: 0)
             }
+            let realCursor = event.location
             event.location = dragPoint
             Self.log.info(
                 "synth-down app=\"\(debugAppName)\" at=(\(String(format: "%.1f", dragPoint.x)),\(String(format: "%.1f", dragPoint.y))) " +
                 "flagsBefore=\(Self.flagDesc(flagsBefore)) flagsOut=\(Self.flagDesc(event.flags)) " +
-                "exposureHolds=\(exposureHoldCount)\(heldForExposure ? " (waited)" : "")"
+                "exposureHolds=\(exposureHoldCount)\(heldForExposure ? " (waited)" : "") " +
+                "realCursor=(\(String(format: "%.1f", realCursor.x)),\(String(format: "%.1f", realCursor.y)))"
             )
-            return Unmanaged.passUnretained(event)
+            return passRewritten(event, realCursor: realCursor)
         }
 
         if rewriteToLeftButton {
@@ -473,12 +499,12 @@ final class TitleBarDragStrategy {
                         "titleBar miss → promote ax app=\"\(debugAppName)\" " +
                         "after \(draggedEventCount) drags travel=\(Int(travel))"
                     )
-                    promoteToAX(fromTitleBarWith: event)
+                    promoteToAX(fromTitleBarWith: event, realCursor: pos)
                     return handleAXDragged(event: event)
                 }
             }
         }
-        return Unmanaged.passUnretained(event)
+        return passRewritten(event, realCursor: pos)
     }
 
     func handleMouseUp(event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -514,6 +540,7 @@ final class TitleBarDragStrategy {
         event.flags = event.flags.subtracting(Self.modifierFlagsToStrip)
         let pos = event.location
         event.location = CGPoint(x: (pos.x + xOffset).rounded(), y: (pos.y + yOffset).rounded())
+        lastRealCursor = pos
         // pendingWindow is cleared after synth-down; resolve by scanning owner pid.
         let moved: String
         if let origin = windowOriginForPID(pendingPID, near: startWindowOrigin) {
@@ -533,7 +560,7 @@ final class TitleBarDragStrategy {
             "flagsOut=\(Self.flagDesc(event.flags)) \(moved)"
         )
         isActive = false
-        return Unmanaged.passUnretained(event)
+        return passRewritten(event, realCursor: pos)
     }
 
     private func windowOriginForPID(_ pid: pid_t, near start: CGPoint) -> CGPoint? {
@@ -580,30 +607,24 @@ final class TitleBarDragStrategy {
         lastAXWriteUptime = 0
     }
 
-    private func promoteToAX(fromTitleBarWith event: CGEvent) {
-        // End any half-open native title-bar drag at the *synthetic* point
-        // (not the real cursor). Posting mouseUp at the cursor while mouseDown
-        // was rewritten to a distant title-bar aim point makes WindowServer
-        // treat the release as a huge drag — the "window floats away" bug.
-        if didSendSyntheticDown {
-            let upPoint = CGPoint(
-                x: (event.location.x + xOffset).rounded(),
-                y: (event.location.y + yOffset).rounded()
-            )
-            if let up = CGEvent(
-                mouseEventSource: nil, mouseType: .leftMouseUp,
-                mouseCursorPosition: upPoint, mouseButton: .left
-            ) {
-                up.flags = event.flags.subtracting(Self.modifierFlagsToStrip)
-                up.post(tap: .cgSessionEventTap)
-            }
-        }
+    private func promoteToAX(fromTitleBarWith event: CGEvent, realCursor: CGPoint) {
+        // Do NOT post a synthetic mouseUp: posting at the rewritten title-bar
+        // point warps the cursor there ("mouse flies away") and still leaves
+        // Electron without a real native drag. Just stop feeding rewritten
+        // events; swallow subsequent ones and drive the window via AX.
         needsInitialMouseDown = false
         didSendSyntheticDown = false
         activeTransport = .ax
 
-        // Re-baseline to the *current* window origin and cursor. Otherwise AX
-        // reapplies the whole mouseDown→now delta and the window teleports.
+        // Put the cursor back under the user's hand before AX takes over.
+        let restore = realCursor == .zero ? lastRealCursor : realCursor
+        if restore != .zero {
+            if let source = CGEventSource(stateID: .combinedSessionState) {
+                source.localEventsSuppressionInterval = 0
+            }
+            CGWarpMouseCursorPosition(restore)
+        }
+
         let liveFrame: CGRect
         if dragWindowID != 0,
            let infos = CGWindowListCopyWindowInfo([.optionIncludingWindow], dragWindowID) as? [[CFString: Any]],
@@ -615,8 +636,11 @@ final class TitleBarDragStrategy {
         } else {
             liveFrame = CGRect(origin: startWindowOrigin, size: CGSize(width: 200, height: 200))
         }
+        // Re-baseline to live window + restored cursor so the first AX write
+        // does not teleport.
         startWindowOrigin = liveFrame.origin
-        startCursor = event.location
+        startCursor = restore
+        lastRealCursor = restore
         armAX(pid: pendingPID, windowFrame: liveFrame)
         Self.log.info(
             "ax-promote-baseline app=\"\(debugAppName)\" " +
@@ -780,6 +804,7 @@ final class TitleBarDragStrategy {
         didSendSyntheticDown = false
         startWindowOrigin = .zero
         startCursor = .zero
+        lastRealCursor = .zero
         debugAppName = ""
         lastAXWriteUptime = 0
     }
