@@ -23,6 +23,8 @@ import ApplicationServices
 /// The window server handles movement natively — same speed as dragging a title bar by hand.
 final class TitleBarDragStrategy {
 
+    private static let log = FileLog("TitleBarDrag")
+
     private(set) var isActive = false
     private(set) var didDrag = false
     private var xOffset: CGFloat = 0
@@ -33,6 +35,11 @@ final class TitleBarDragStrategy {
     private var pendingWindow: CGWindowID?
     private var pendingPID: pid_t = 0
     private var startupDeadline: TimeInterval = 0
+    private var draggedEventCount = 0
+    private var exposureHoldCount = 0
+    private var didSendSyntheticDown = false
+    private var startWindowOrigin: CGPoint = .zero
+    private var debugAppName: String = ""
     private let activateApplication: (pid_t, NSApplication.ActivationOptions) -> Bool
     private let coveringPID: (CGWindowID, CGPoint) -> pid_t?
     private let now: () -> TimeInterval
@@ -142,6 +149,24 @@ final class TitleBarDragStrategy {
     /// Diagnostics aid; off by default.
     var showDebugDot: Bool = false
 
+    private static func flagDesc(_ flags: CGEventFlags) -> String {
+        var parts: [String] = []
+        if flags.contains(.maskControl) { parts.append("⌃") }
+        if flags.contains(.maskAlternate) { parts.append("⌥") }
+        if flags.contains(.maskShift) { parts.append("⇧") }
+        if flags.contains(.maskCommand) { parts.append("⌘") }
+        if flags.contains(.maskSecondaryFn) { parts.append("fn") }
+        return parts.isEmpty ? "—" : parts.joined()
+    }
+
+    private static func windowOrigin(of windowID: CGWindowID) -> CGPoint? {
+        guard let infos = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[CFString: Any]],
+              let info = infos.first,
+              let bounds = info[kCGWindowBounds] as? [String: Any],
+              let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return nil }
+        return frame.origin
+    }
+
     func handleMouseDown(pid: pid_t, windowID: CGWindowID, windowFrame: CGRect, event: CGEvent, rewriteToLeftButton: Bool = false, titleBarYOffset: CGFloat? = nil, titleBarXOffsets: TitleBarXOffsets? = nil, visibleTopInset: CGFloat = 0, activateApp: Bool = true, debugCaption: String? = nil) -> Unmanaged<CGEvent>? {
         let cursorPos = event.location
 
@@ -184,6 +209,30 @@ final class TitleBarDragStrategy {
         // Preserve the old X rounding behavior when the fixed-X option is disabled.
         xOffset = fixedX ? dragPoint.x - cursorPos.x : 0
         yOffset = dragPoint.y - cursorPos.y
+
+        let app = NSRunningApplication(processIdentifier: pid)
+        let bundleID = app?.bundleIdentifier ?? "?"
+        let appName = app?.localizedName ?? "pid:\(pid)"
+        debugAppName = appName
+        startWindowOrigin = windowFrame.origin
+        draggedEventCount = 0
+        exposureHoldCount = 0
+        didSendSyntheticDown = false
+        let rawFlags = event.flags
+        let strippedPreview = rawFlags.subtracting(Self.modifierFlagsToStrip)
+        let relX = dragPoint.x - windowFrame.origin.x
+        let relY = dragPoint.y - windowFrame.origin.y
+        Self.log.info(
+            "begin app=\"\(appName)\" bundle=\(bundleID) wid=\(windowID) " +
+            "frame=\(Int(windowFrame.width))x\(Int(windowFrame.height))@(\(Int(windowFrame.origin.x)),\(Int(windowFrame.origin.y))) " +
+            "cursor=(\(String(format: "%.1f", cursorPos.x)),\(String(format: "%.1f", cursorPos.y))) " +
+            "aim=(\(String(format: "%.1f", dragPoint.x)),\(String(format: "%.1f", dragPoint.y))) " +
+            "relAim=(\(String(format: "%.1f", relX)),\(String(format: "%.1f", relY))) " +
+            "fixedX=\(fixedX) yOff=\(String(format: "%.1f", effectiveOffset)) visInset=\(String(format: "%.1f", visibleTopInset)) " +
+            "xOff=\(String(format: "%.1f", xOffset)) yDelta=\(String(format: "%.1f", yOffset)) " +
+            "flagsIn=\(Self.flagDesc(rawFlags)) flagsSynth=\(Self.flagDesc(strippedPreview)) " +
+            "activateApp=\(activateApp) probe=\(debugCaption ?? "—")"
+        )
 
         // Raise the window and activate its app. Activating the app is what
         // makes the synthesized title-bar click land on the window we mean
@@ -261,6 +310,7 @@ final class TitleBarDragStrategy {
 
     func handleMouseDragged(event: CGEvent) -> Unmanaged<CGEvent>? {
         didDrag = true
+        let flagsBefore = event.flags
         event.flags = event.flags.subtracting(Self.modifierFlagsToStrip)
         if needsInitialMouseDown {
             if let window = pendingWindow, let coverer = coveringPID(window, dragPoint),
@@ -276,10 +326,22 @@ final class TitleBarDragStrategy {
                 // behaviour that shipped before this check existed, and it keeps
                 // a window draggable under an overlay the check cannot see
                 // through.
+                exposureHoldCount += 1
+                if exposureHoldCount == 1 || exposureHoldCount % 8 == 0 {
+                    let covererName = NSRunningApplication(processIdentifier: coverer)?.localizedName ?? "pid:\(coverer)"
+                    Self.log.info(
+                        "exposure-hold #\(exposureHoldCount) app=\"\(debugAppName)\" " +
+                        "aim=(\(String(format: "%.1f", dragPoint.x)),\(String(format: "%.1f", dragPoint.y))) " +
+                        "coveredBy=\"\(covererName)\"(\(coverer))"
+
+                    )
+                }
                 return nil
             }
+            let heldForExposure = exposureHoldCount > 0
             pendingWindow = nil
             needsInitialMouseDown = false
+            didSendSyntheticDown = true
             // Convert this mouseDragged into a mouseDown at the title bar.
             // The selected window is now exposed at this exact click point.
             event.type = .leftMouseDown
@@ -287,6 +349,11 @@ final class TitleBarDragStrategy {
                 event.setIntegerValueField(.mouseEventButtonNumber, value: 0)
             }
             event.location = dragPoint
+            Self.log.info(
+                "synth-down app=\"\(debugAppName)\" at=(\(String(format: "%.1f", dragPoint.x)),\(String(format: "%.1f", dragPoint.y))) " +
+                "flagsBefore=\(Self.flagDesc(flagsBefore)) flagsOut=\(Self.flagDesc(event.flags)) " +
+                "exposureHolds=\(exposureHoldCount)\(heldForExposure ? " (waited)" : "")"
+            )
             return Unmanaged.passUnretained(event)
         }
 
@@ -298,7 +365,17 @@ final class TitleBarDragStrategy {
         // Translate both axes relative to the initial title-bar click.
         // Round both axes like the initial click so the final translation stays integral.
         let pos = event.location
-        event.location = CGPoint(x: (pos.x + xOffset).rounded(), y: (pos.y + yOffset).rounded())
+        let rewritten = CGPoint(x: (pos.x + xOffset).rounded(), y: (pos.y + yOffset).rounded())
+        event.location = rewritten
+        draggedEventCount += 1
+        if draggedEventCount <= 3 {
+            Self.log.debug(
+                "synth-drag #\(draggedEventCount) app=\"\(debugAppName)\" " +
+                "cursor=(\(String(format: "%.1f", pos.x)),\(String(format: "%.1f", pos.y))) " +
+                "out=(\(String(format: "%.1f", rewritten.x)),\(String(format: "%.1f", rewritten.y))) " +
+                "flags=\(Self.flagDesc(event.flags))"
+            )
+        }
         return Unmanaged.passUnretained(event)
     }
 
@@ -311,6 +388,11 @@ final class TitleBarDragStrategy {
             // middle-click behavior). Suppress both buttons after an attempted
             // drag so a held-back press can't leak an unmatched mouse-up.
             let suppressForReplay = rewriteToLeftButton || didDrag
+            Self.log.warn(
+                "abort-before-synth-down app=\"\(debugAppName)\" didDrag=\(didDrag) " +
+                "exposureHolds=\(exposureHoldCount) suppressUp=\(suppressForReplay) " +
+                "startOrigin=(\(Int(startWindowOrigin.x)),\(Int(startWindowOrigin.y)))"
+            )
             needsInitialMouseDown = false
             isActive = false
             return suppressForReplay ? nil : Unmanaged.passUnretained(event)
@@ -324,8 +406,47 @@ final class TitleBarDragStrategy {
         event.flags = event.flags.subtracting(Self.modifierFlagsToStrip)
         let pos = event.location
         event.location = CGPoint(x: (pos.x + xOffset).rounded(), y: (pos.y + yOffset).rounded())
+        // pendingWindow is cleared after synth-down; resolve by scanning owner pid.
+        let moved: String
+        if let origin = windowOriginForPID(pendingPID, near: startWindowOrigin) {
+            let dx = origin.x - startWindowOrigin.x
+            let dy = origin.y - startWindowOrigin.y
+            let movedOK = abs(dx) >= 1 || abs(dy) >= 1
+            moved = "windowMoved=\(movedOK) " + String(
+                format: "delta=(%.1f,%.1f) endOrigin=(%.0f,%.0f)",
+                dx, dy, origin.x, origin.y
+            )
+        } else {
+            moved = "windowMoved=unknown delta=unknown"
+        }
+        Self.log.info(
+            "end app=\"\(debugAppName)\" sentSynthDown=\(didSendSyntheticDown) " +
+            "dragEvents=\(draggedEventCount) exposureHolds=\(exposureHoldCount) " +
+            "flagsOut=\(Self.flagDesc(event.flags)) \(moved)"
+        )
         isActive = false
         return Unmanaged.passUnretained(event)
+    }
+
+    private func windowOriginForPID(_ pid: pid_t, near start: CGPoint) -> CGPoint? {
+        guard pid != 0,
+              let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[CFString: Any]] else { return nil }
+        var best: CGPoint?
+        var bestDist = CGFloat.greatestFiniteMagnitude
+        for info in infos {
+            guard (info[kCGWindowOwnerPID] as? pid_t) == pid || (info[kCGWindowOwnerPID] as? Int).map({ pid_t($0) }) == pid,
+                  (info[kCGWindowLayer] as? Int) == 0,
+                  let bounds = info[kCGWindowBounds] as? [String: Any],
+                  let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  frame.width > 100, frame.height > 100 else { continue }
+            let dist = abs(frame.origin.x - start.x) + abs(frame.origin.y - start.y)
+            if dist < bestDist {
+                bestDist = dist
+                best = frame.origin
+            }
+        }
+        return best
     }
 
     func reset() {
@@ -339,6 +460,11 @@ final class TitleBarDragStrategy {
         pendingWindow = nil
         pendingPID = 0
         startupDeadline = 0
+        draggedEventCount = 0
+        exposureHoldCount = 0
+        didSendSyntheticDown = false
+        startWindowOrigin = .zero
+        debugAppName = ""
     }
 
     // MARK: - AX Window Lookup

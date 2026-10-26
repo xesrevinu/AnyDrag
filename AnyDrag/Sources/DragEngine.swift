@@ -1221,12 +1221,24 @@ final class DragEngine {
         // A stranded right-resize is already dropped at the top of this method
         // (the stale-`resizeStrategy` guard), so nothing to clear here.
         strategy.reset()
-        Self.log.info("drag start: app=\"\(windowInfo.app)\" wid=\(windowInfo.windowID)")
+        let bundleID = NSRunningApplication(processIdentifier: windowInfo.pid)?.bundleIdentifier ?? "?"
+        let flagsDesc: String = {
+            var parts: [String] = []
+            let f = event.flags
+            if f.contains(.maskControl) { parts.append("⌃") }
+            if f.contains(.maskAlternate) { parts.append("⌥") }
+            if f.contains(.maskShift) { parts.append("⇧") }
+            if f.contains(.maskCommand) { parts.append("⌘") }
+            if f.contains(.maskSecondaryFn) { parts.append("fn") }
+            return parts.isEmpty ? "—" : parts.joined()
+        }()
+        Self.log.info("drag start: app=\"\(windowInfo.app)\" bundle=\(bundleID) wid=\(windowInfo.windowID) flags=\(flagsDesc) target=\(self.modifiers.symbol)")
         armPlainCommandClickReplay(for: event, app: windowInfo.app)
         let offset = effectiveTitleBarYOffset(forPid: windowInfo.pid)
         let probe = visibleTopInset(pid: windowInfo.pid, windowFrame: windowInfo.frame,
                                     aimX: event.location.x, cursorY: event.location.y)
-        Self.log.info("top probe: app=\"\(windowInfo.app)\" window=\(Int(windowInfo.frame.width))x\(Int(windowInfo.frame.height)) \(probe.summary)")
+        let xOff = perAppTitleBarXOffsetPids.withLock { $0[windowInfo.pid] }
+        Self.log.info("top probe: app=\"\(windowInfo.app)\" window=\(Int(windowInfo.frame.width))x\(Int(windowInfo.frame.height)) \(probe.summary) yOffset=\(String(format: "%.1f", offset)) perAppX=\(xOff.map { "L\(Int($0.left))/R\(Int($0.right))" } ?? "global")")
         beginFlagScrub(candidates: TitleBarDragStrategy.modifierFlagsToStrip, heldOn: event)
         return strategy.handleMouseDown(
             pid: windowInfo.pid,
