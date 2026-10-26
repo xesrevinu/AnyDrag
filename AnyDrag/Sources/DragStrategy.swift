@@ -19,14 +19,38 @@ import ApplicationServices
 // Result: zero per-frame IPC. The window server moves the window directly at compositor level,
 // identical in performance to manually dragging a title bar.
 
-/// Rewrites mouse event coordinates to the window's title bar region.
-/// The window server handles movement natively — same speed as dragging a title bar by hand.
+/// How Move actually relocates the window once the gesture is armed.
+///
+/// - `auto`: prefer SkyLight (`SLSMoveWindowWithGroup`) when the private
+///   symbols resolve (SIP-off machines); otherwise title-bar synthesis.
+/// - `sls`: always try SkyLight; fall back to title-bar only if unavailable.
+/// - `titleBar`: stock AnyDrag path (synth title-bar drag).
+enum MoveTransportMode: String, CaseIterable {
+    case auto
+    case sls
+    case titleBar
+}
+
+/// Active transport for the in-flight gesture (set at mouseDown).
+enum MoveTransport: String {
+    case titleBar
+    case sls
+}
+
+/// Rewrites mouse event coordinates to the window's title bar region,
+/// **or** (preferred on SIP-off) moves the window via SkyLight each frame.
+/// Title-bar synthesis matches grabbing a real title bar; SLS bypasses
+/// Electron/Pake/GPUI non-client hit testing that makes synth-down a no-op.
 final class TitleBarDragStrategy {
 
     private static let log = FileLog("TitleBarDrag")
 
     private(set) var isActive = false
     private(set) var didDrag = false
+    /// Transport chosen for the current gesture (for diagnostics).
+    private(set) var activeTransport: MoveTransport = .titleBar
+    /// Preference: which transport to prefer when arming a drag.
+    var moveTransportMode: MoveTransportMode = .auto
     private var xOffset: CGFloat = 0
     private var yOffset: CGFloat = 0
     private var dragPoint: CGPoint = .zero
@@ -39,10 +63,19 @@ final class TitleBarDragStrategy {
     private var exposureHoldCount = 0
     private var didSendSyntheticDown = false
     private var startWindowOrigin: CGPoint = .zero
+    private var startCursor: CGPoint = .zero
     private var debugAppName: String = ""
     private let activateApplication: (pid_t, NSApplication.ActivationOptions) -> Bool
     private let coveringPID: (CGWindowID, CGPoint) -> pid_t?
     private let now: () -> TimeInterval
+
+    /// Whether this preference + runtime availability should use SLS for Move.
+    var shouldPreferSLS: Bool {
+        switch moveTransportMode {
+        case .titleBar: return false
+        case .sls, .auto: return SLSWindowGeometry.isAvailable
+        }
+    }
 
     /// How long the synthetic press waits for the compositor to expose the
     /// target before it is sent regardless.
@@ -222,8 +255,10 @@ final class TitleBarDragStrategy {
         let strippedPreview = rawFlags.subtracting(Self.modifierFlagsToStrip)
         let relX = dragPoint.x - windowFrame.origin.x
         let relY = dragPoint.y - windowFrame.origin.y
+        let useSLS = shouldPreferSLS
+        startCursor = cursorPos
         Self.log.info(
-            "begin app=\"\(appName)\" bundle=\(bundleID) wid=\(windowID) " +
+            "begin app=\"\(appName)\" bundle=\(bundleID) wid=\(windowID) transport=\(useSLS ? "sls" : "titleBar") mode=\(moveTransportMode.rawValue) " +
             "frame=\(Int(windowFrame.width))x\(Int(windowFrame.height))@(\(Int(windowFrame.origin.x)),\(Int(windowFrame.origin.y))) " +
             "cursor=(\(String(format: "%.1f", cursorPos.x)),\(String(format: "%.1f", cursorPos.y))) " +
             "aim=(\(String(format: "%.1f", dragPoint.x)),\(String(format: "%.1f", dragPoint.y))) " +
@@ -300,16 +335,35 @@ final class TitleBarDragStrategy {
 
         isActive = true
         didDrag = false
-        needsInitialMouseDown = true
         pendingWindow = windowID
         pendingPID = pid
-        startupDeadline = now() + Self.startupGracePeriod
         self.rewriteToLeftButton = rewriteToLeftButton
+
+        if useSLS {
+            // SLS path: no synthetic title-bar press. Swallow mouse events and
+            // write the window origin each dragged frame. Prefer live SLS
+            // bounds when available so we start from compositor truth.
+            if let live = SLSWindowGeometry.bounds(of: windowID) {
+                startWindowOrigin = live.origin
+            }
+            activeTransport = .sls
+            needsInitialMouseDown = false
+            startupDeadline = 0
+            Self.log.info("sls-arm app=\"\(appName)\" wid=\(windowID) origin=(\(Int(startWindowOrigin.x)),\(Int(startWindowOrigin.y)))")
+            return nil
+        }
+
+        activeTransport = .titleBar
+        needsInitialMouseDown = true
+        startupDeadline = now() + Self.startupGracePeriod
         return nil  // suppress — the mouseDown will be sent on first drag
     }
 
     func handleMouseDragged(event: CGEvent) -> Unmanaged<CGEvent>? {
         didDrag = true
+        if activeTransport == .sls {
+            return handleSLSDragged(event: event)
+        }
         let flagsBefore = event.flags
         event.flags = event.flags.subtracting(Self.modifierFlagsToStrip)
         if needsInitialMouseDown {
@@ -380,6 +434,9 @@ final class TitleBarDragStrategy {
     }
 
     func handleMouseUp(event: CGEvent) -> Unmanaged<CGEvent>? {
+        if activeTransport == .sls {
+            return handleSLSUp(event: event)
+        }
         if needsInitialMouseDown {
             // No synthetic press was sent: a plain click, or the press was still
             // being held back when the button came up. For middle-button entry
@@ -420,7 +477,7 @@ final class TitleBarDragStrategy {
             moved = "windowMoved=unknown delta=unknown"
         }
         Self.log.info(
-            "end app=\"\(debugAppName)\" sentSynthDown=\(didSendSyntheticDown) " +
+            "end app=\"\(debugAppName)\" transport=titleBar sentSynthDown=\(didSendSyntheticDown) " +
             "dragEvents=\(draggedEventCount) exposureHolds=\(exposureHoldCount) " +
             "flagsOut=\(Self.flagDesc(event.flags)) \(moved)"
         )
@@ -449,9 +506,76 @@ final class TitleBarDragStrategy {
         return best
     }
 
+    // MARK: - SLS (SkyLight) move transport
+
+    private func handleSLSDragged(event: CGEvent) -> Unmanaged<CGEvent>? {
+        guard let windowID = pendingWindow else { return nil }
+        let cursor = event.location
+        let origin = CGPoint(
+            x: startWindowOrigin.x + (cursor.x - startCursor.x),
+            y: startWindowOrigin.y + (cursor.y - startCursor.y)
+        )
+        let ok = SLSWindowGeometry.moveWindow(windowID, origin: origin)
+        draggedEventCount += 1
+        if draggedEventCount <= 3 || !ok {
+            Self.log.debug(
+                "sls-drag #\(draggedEventCount) app=\"\(debugAppName)\" " +
+                "origin=(\(String(format: "%.1f", origin.x)),\(String(format: "%.1f", origin.y))) ok=\(ok)"
+            )
+        }
+        if !ok {
+            // Private move rejected mid-gesture — degrade to title-bar for the
+            // remainder so the user is not stuck with a dead drag.
+            Self.log.warn("sls-drag failed; falling back to titleBar synth for rest of gesture")
+            activeTransport = .titleBar
+            needsInitialMouseDown = true
+            dragPoint = CGPoint(
+                x: (startWindowOrigin.x + 100).rounded(),
+                y: (startWindowOrigin.y + 4).rounded()
+            )
+            xOffset = dragPoint.x - cursor.x
+            yOffset = dragPoint.y - cursor.y
+            startupDeadline = now() + Self.startupGracePeriod
+            return handleMouseDragged(event: event)
+        }
+        return nil  // swallow — we moved the window ourselves
+    }
+
+    private func handleSLSUp(event: CGEvent) -> Unmanaged<CGEvent>? {
+        if let windowID = pendingWindow, didDrag {
+            let cursor = event.location
+            let origin = CGPoint(
+                x: startWindowOrigin.x + (cursor.x - startCursor.x),
+                y: startWindowOrigin.y + (cursor.y - startCursor.y)
+            )
+            _ = SLSWindowGeometry.moveWindow(windowID, origin: origin)
+        }
+        let endOrigin = pendingWindow.flatMap { SLSWindowGeometry.bounds(of: $0)?.origin }
+            ?? windowOriginForPID(pendingPID, near: startWindowOrigin)
+        let moved: String
+        if let origin = endOrigin {
+            let dx = origin.x - startWindowOrigin.x
+            let dy = origin.y - startWindowOrigin.y
+            let movedOK = abs(dx) >= 1 || abs(dy) >= 1
+            moved = "windowMoved=\(movedOK) " + String(
+                format: "delta=(%.1f,%.1f) endOrigin=(%.0f,%.0f)",
+                dx, dy, origin.x, origin.y
+            )
+        } else {
+            moved = "windowMoved=unknown delta=unknown"
+        }
+        Self.log.info(
+            "end app=\"\(debugAppName)\" transport=sls sentSynthDown=false " +
+            "dragEvents=\(draggedEventCount) \(moved)"
+        )
+        isActive = false
+        return nil
+    }
+
     func reset() {
         isActive = false
         didDrag = false
+        activeTransport = .titleBar
         xOffset = 0
         yOffset = 0
         dragPoint = .zero
@@ -464,6 +588,7 @@ final class TitleBarDragStrategy {
         exposureHoldCount = 0
         didSendSyntheticDown = false
         startWindowOrigin = .zero
+        startCursor = .zero
         debugAppName = ""
     }
 

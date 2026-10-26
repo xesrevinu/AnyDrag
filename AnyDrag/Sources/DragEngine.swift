@@ -354,6 +354,12 @@ final class DragEngine {
         }
     }
 
+    /// Preferred Move transport (SLS vs title-bar synth). See `MoveTransportMode`.
+    var moveTransportMode: MoveTransportMode {
+        get { strategy.moveTransportMode }
+        set { strategy.moveTransportMode = newValue }
+    }
+
     private var runLoopSource: CFRunLoopSource?
     private var tapThread: Thread?
 
@@ -667,7 +673,8 @@ final class DragEngine {
         startBackstopTimer()
 
         Self.log.info("start(): tap created OK")
-        Self.log.info("config: modifier=\(self.modifiers.symbol) drag=\(self.dragEnabled) max=\(self.maximizeEnabled) tile=\(self.tilingEnabled) resizeTrigger=\(self.resizeTrigger.rawValue)/\(self.leftResizeModifier.symbol) middle=\(self.middleAction.rawValue) tileDragOnly=\(self.tileByDirectionDragOnly) linkedResize=\(self.linkedResizeEnabled) overlayEdgeSafe=\(self.overlayEdgeSafeEnabled) yOffset=\(self.strategy.titleBarYOffset) fixedTitleBarX=\(self.strategy.useFixedTitleBarX) leftInset=\(self.strategy.titleBarLeftInset) rightInset=\(self.strategy.titleBarRightInset) perAppYOffsets=\(self.perAppTitleBarYOffsetsByBundleID.count) perAppXOffsets=\(self.perAppTitleBarXOffsetsByBundleID.count) debugDot=\(self.strategy.showDebugDot)")
+        SLSWindowGeometry.logAvailability()
+        Self.log.info("config: modifier=\(self.modifiers.symbol) drag=\(self.dragEnabled) max=\(self.maximizeEnabled) tile=\(self.tilingEnabled) resizeTrigger=\(self.resizeTrigger.rawValue)/\(self.leftResizeModifier.symbol) middle=\(self.middleAction.rawValue) tileDragOnly=\(self.tileByDirectionDragOnly) linkedResize=\(self.linkedResizeEnabled) overlayEdgeSafe=\(self.overlayEdgeSafeEnabled) moveTransport=\(self.strategy.moveTransportMode.rawValue) slsAvailable=\(SLSWindowGeometry.isAvailable) yOffset=\(self.strategy.titleBarYOffset) fixedTitleBarX=\(self.strategy.useFixedTitleBarX) leftInset=\(self.strategy.titleBarLeftInset) rightInset=\(self.strategy.titleBarRightInset) perAppYOffsets=\(self.perAppTitleBarYOffsetsByBundleID.count) perAppXOffsets=\(self.perAppTitleBarXOffsetsByBundleID.count) debugDot=\(self.strategy.showDebugDot)")
     }
 
     func stop() {

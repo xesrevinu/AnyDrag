@@ -95,6 +95,9 @@ enum Preferences {
         static let titleBarYOffset    = "AnyDragTitleBarYOffset"
         static let showDebugDot       = "AnyDragShowDebugDot"
         static let resizeCornerInset  = "AnyDragResizeCornerInset"
+        // Move transport: "auto" (SLS when available) / "sls" / "titleBar".
+        // Absent = auto. This fork defaults to SkyLight move under SIP-off.
+        static let moveTransport      = "AnyDragMoveTransport"
         // Whether the (collapsed-by-default) Diagnostics section is expanded.
         // Absent = collapsed.
         static let diagnosticsExpanded = "AnyDragDiagnosticsExpanded"
@@ -461,6 +464,14 @@ enum Preferences {
         }
 
         engine.showDebugDot = d.object(forKey: Key.showDebugDot) as? Bool ?? false
+
+        // Move transport: default auto (SLS when private symbols resolve).
+        if let raw = d.string(forKey: Key.moveTransport),
+           let mode = MoveTransportMode(rawValue: raw) {
+            engine.moveTransportMode = mode
+        } else {
+            engine.moveTransportMode = .auto
+        }
 
         engine.setBlacklistedBundleIDs(Set(blacklistedApps().map { $0.bundleID }))
 
