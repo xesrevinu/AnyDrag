@@ -95,8 +95,8 @@ enum Preferences {
         static let titleBarYOffset    = "AnyDragTitleBarYOffset"
         static let showDebugDot       = "AnyDragShowDebugDot"
         static let resizeCornerInset  = "AnyDragResizeCornerInset"
-        // Move transport: "auto" (titleBar → AX) / "titleBar" / "ax" / "sls".
-        // Absent = auto. SLS is experimental (often no-ops inside the event tap).
+        // Move transport: "auto"|"ax" (AX position) / "titleBar" / "sls" (experimental).
+        // Absent = auto. Title-bar synthesis is opt-in; SLS often no-ops in the tap.
         static let moveTransport      = "AnyDragMoveTransport"
         // Whether the (collapsed-by-default) Diagnostics section is expanded.
         // Absent = collapsed.

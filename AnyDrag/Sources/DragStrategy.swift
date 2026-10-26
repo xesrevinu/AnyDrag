@@ -1,33 +1,29 @@
 import Cocoa
 import ApplicationServices
 
-// MARK: - How Title Bar Drag Simulation Works
+// MARK: - Move transports
 //
-// Instead of using the Accessibility API to set window positions (slow, ~5-10ms IPC per frame),
-// we trick the window server into thinking the user is dragging the title bar:
+// Default (`auto` / `ax`): swallow modifier+mouse events and write
+// `kAXPosition` each frame (EnhancedUI temporarily disabled). Works for
+// AppKit, Electron, Pake, and GPUI without depending on title-bar hit testing.
+// Cursor location is never rewritten, so the pointer stays under the hand.
 //
-// 1. modifier+mouseDown: suppress the event, raise and activate only the target window.
-// 2. First mouseDragged once the target is exposed (or another app still covers it after
-//    250 ms): convert it into a mouseDown at its title bar (Y near the window top, X at the
-//    cursor or configured edge insets). The window server sees a title bar click and begins
-//    a native drag. The exposure check only delays the press; it never cancels the drag.
-// 3. Subsequent mouseDragged: translate coordinates by a fixed offset so the window
-//    server sees movement relative to the title bar click point.
-//    Coordinates are rounded consistently so the window follows the cursor on whole points.
-// 4. mouseUp: apply the same translation, ending the native drag.
+// Optional `titleBar`: classic AnyDrag synthesis — rewrite event coordinates
+// into the title-bar region so WindowServer performs a native drag (zero
+// per-frame IPC when it works). After each rewrite we warp the cursor back
+// to the real position; otherwise the pointer jumps to the synthetic aim point.
 //
-// Result: zero per-frame IPC. The window server moves the window directly at compositor level,
-// identical in performance to manually dragging a title bar.
+// Optional `sls`: experimental SkyLight `SLSMoveWindowWithGroup`. Resolves on
+// this machine outside the event tap, but is a silent no-op *inside* the tap —
+// kept only for opt-in experiments; falls back to AX if bounds do not change.
 
-/// How Move relocates the window once the gesture is armed.
+/// Preference for which Move transport to arm.
 ///
-/// - `auto`: title-bar synthesis first (best when it works); if the window
-///   origin does not move shortly after synth-down, fall back to AX position
-///   writes (Electron / Pake / GPUI).
-/// - `titleBar`: synthesis only.
-/// - `ax`: Accessibility `kAXPosition` only (with EnhancedUI workaround).
-/// - `sls`: experimental SkyLight move; verified against live bounds and
-///   falls back to AX on silent no-op (event-tap context often no-ops).
+/// - `auto`: same as `ax` (AX-first). Kept as the default so existing installs
+///   that wrote `auto` keep working without a migration.
+/// - `ax`: Accessibility position writes.
+/// - `titleBar`: native title-bar event synthesis only (no AX fallback).
+/// - `sls`: experimental SkyLight move with AX fallback on silent no-op.
 enum MoveTransportMode: String, CaseIterable {
     case auto
     case titleBar
@@ -42,10 +38,8 @@ enum MoveTransport: String {
     case sls
 }
 
-/// Rewrites mouse event coordinates to the window's title bar region,
-/// **or** (preferred on SIP-off) moves the window via SkyLight each frame.
-/// Title-bar synthesis matches grabbing a real title bar; SLS bypasses
-/// Electron/Pake/GPUI non-client hit testing that makes synth-down a no-op.
+/// Arms a modifier-drag and moves the target window via AX (default) or
+/// optional title-bar synthesis / SkyLight.
 final class TitleBarDragStrategy {
 
     private static let log = FileLog("TitleBarDrag")
@@ -87,13 +81,6 @@ final class TitleBarDragStrategy {
     private var axWindow: AXUIElement?
     private var axEnhancedUIWasOn = false
     private var lastAXWriteUptime: TimeInterval = 0
-    /// After synth-down, how long we wait before declaring title-bar a miss.
-    /// Too short (≲100ms) promotes native apps (Ghostty) before WindowServer
-    /// has committed the first frame of the title-bar drag.
-    private static let titleBarPromoteGrace: TimeInterval = 0.22
-    /// Require real cursor travel before promoting — avoids AX teleports on
-    /// click-without-drag and filters tap jitter.
-    private static let titleBarPromoteMinTravel: CGFloat = 8
     private static let axWriteMinInterval: TimeInterval = 1.0 / 120.0
 
     /// Pass a location-rewritten event through the tap without leaving the
@@ -292,10 +279,6 @@ final class TitleBarDragStrategy {
         let initialTransport: MoveTransport = {
             switch moveTransportMode {
             case .ax, .auto:
-                // `auto` goes AX-first: title-bar coordinate rewrite warps the
-                // system cursor to the aim point, and when the window does not
-                // follow (Electron/Pake/GPUI) the pointer just "flies away".
-                // AX swallows events and never rewrites cursor location.
                 return .ax
             case .sls: return SLSWindowGeometry.isAvailable ? .sls : .ax
             case .titleBar: return .titleBar
@@ -485,25 +468,6 @@ final class TitleBarDragStrategy {
                 "flags=\(Self.flagDesc(event.flags))"
             )
         }
-        // auto: if title-bar synth is a no-op, promote to AX.
-        if moveTransportMode == .auto, didSendSyntheticDown {
-            let travel = hypot(pos.x - startCursor.x, pos.y - startCursor.y)
-            let aged = now() - max(gestureStartTime, startupDeadline - Self.startupGracePeriod)
-            // `startupDeadline` still holds arm+grace even after synth-down.
-            if travel >= Self.titleBarPromoteMinTravel, aged >= Self.titleBarPromoteGrace {
-                let live = (dragWindowID != 0 ? Self.windowOrigin(of: dragWindowID) : nil)
-                    ?? windowOriginForPID(pendingPID, near: startWindowOrigin)
-                let moved = live.map { abs($0.x - startWindowOrigin.x) >= 1 || abs($0.y - startWindowOrigin.y) >= 1 } ?? false
-                if !moved {
-                    Self.log.info(
-                        "titleBar miss → promote ax app=\"\(debugAppName)\" " +
-                        "after \(draggedEventCount) drags travel=\(Int(travel))"
-                    )
-                    promoteToAX(fromTitleBarWith: event, realCursor: pos)
-                    return handleAXDragged(event: event)
-                }
-            }
-        }
         return passRewritten(event, realCursor: pos)
     }
 
@@ -607,49 +571,6 @@ final class TitleBarDragStrategy {
         lastAXWriteUptime = 0
     }
 
-    private func promoteToAX(fromTitleBarWith event: CGEvent, realCursor: CGPoint) {
-        // Do NOT post a synthetic mouseUp: posting at the rewritten title-bar
-        // point warps the cursor there ("mouse flies away") and still leaves
-        // Electron without a real native drag. Just stop feeding rewritten
-        // events; swallow subsequent ones and drive the window via AX.
-        needsInitialMouseDown = false
-        didSendSyntheticDown = false
-        activeTransport = .ax
-
-        // Put the cursor back under the user's hand before AX takes over.
-        let restore = realCursor == .zero ? lastRealCursor : realCursor
-        if restore != .zero {
-            if let source = CGEventSource(stateID: .combinedSessionState) {
-                source.localEventsSuppressionInterval = 0
-            }
-            CGWarpMouseCursorPosition(restore)
-        }
-
-        let liveFrame: CGRect
-        if dragWindowID != 0,
-           let infos = CGWindowListCopyWindowInfo([.optionIncludingWindow], dragWindowID) as? [[CFString: Any]],
-           let bounds = infos.first?[kCGWindowBounds] as? [String: Any],
-           let r = CGRect(dictionaryRepresentation: bounds as CFDictionary) {
-            liveFrame = r
-        } else if let origin = windowOriginForPID(pendingPID, near: startWindowOrigin) {
-            liveFrame = CGRect(origin: origin, size: CGSize(width: 200, height: 200))
-        } else {
-            liveFrame = CGRect(origin: startWindowOrigin, size: CGSize(width: 200, height: 200))
-        }
-        // Re-baseline to live window + restored cursor so the first AX write
-        // does not teleport.
-        startWindowOrigin = liveFrame.origin
-        startCursor = restore
-        lastRealCursor = restore
-        armAX(pid: pendingPID, windowFrame: liveFrame)
-        Self.log.info(
-            "ax-promote-baseline app=\"\(debugAppName)\" " +
-            "origin=(\(Int(startWindowOrigin.x)),\(Int(startWindowOrigin.y))) " +
-            "cursor=(\(String(format: "%.1f", startCursor.x)),\(String(format: "%.1f", startCursor.y))) " +
-            "ax=\(axWindow != nil)"
-        )
-    }
-
     private func handleAXDragged(event: CGEvent) -> Unmanaged<CGEvent>? {
         draggedEventCount += 1
         let nowTs = now()
@@ -671,7 +592,7 @@ final class TitleBarDragStrategy {
         if let value = AXValueCreate(.cgPoint, &origin) {
             let err = AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, value)
             if draggedEventCount <= 3 || err != .success {
-                Self.log.info(
+                Self.log.debug(
                     "ax-drag #\(draggedEventCount) app=\"\(debugAppName)\" " +
                     "origin=(\(Int(origin.x)),\(Int(origin.y))) err=\(err.rawValue)"
                 )

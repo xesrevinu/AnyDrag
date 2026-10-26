@@ -1,16 +1,12 @@
 import CoreGraphics
 import Foundation
 
-/// Thin wrappers around SkyLight / CoreGraphics private window-geometry APIs.
+/// Experimental SkyLight / CoreGraphics private window-geometry wrappers.
 ///
-/// On this machine with SIP disabled, an independent process can move **other
-/// apps'** windows via `SLSMoveWindowWithGroup` (verified against Grok / Zed /
-/// Multica / Zen). Space *reassignment* APIs remain a separate privilege story
-/// and are not used here.
-///
-/// These symbols are private: they can vanish or change semantics across
-/// macOS updates. Callers must treat `isAvailable` as dynamic and keep a
-/// public fallback (title-bar synth or AX).
+/// `SLSMoveWindowWithGroup` can move other apps' windows from a normal process
+/// when SIP is disabled — but calls made **inside AnyDrag's CGEventTap
+/// callback** return success and leave the window unmoved. Prefer AX for Move.
+/// This module remains for the opt-in `MoveTransportMode.sls` experiment.
 enum SLSWindowGeometry {
 
     private static let log = FileLog("SLSGeometry")
